@@ -46,6 +46,7 @@ class UndoCommandModule:
 
 class PluginUndo(Plugin):
     name = "plugin_undo"
+    version = "1.0.0"
 
     def telegram_bot_commands(self) -> list[tuple[str, str]]:
         return [("undo", "撤销上一轮对话")]
