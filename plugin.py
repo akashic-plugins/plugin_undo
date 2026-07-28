@@ -45,6 +45,7 @@ class UndoCommandModule:
 
 
 class PluginUndo(Plugin):
+    api_version = 2
     name = "plugin_undo"
     version = "1.0.0"
 
