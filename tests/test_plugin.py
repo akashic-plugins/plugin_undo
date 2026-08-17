@@ -216,7 +216,14 @@ async def test_real_manager_candidate_is_inert_and_formal_command_deletes(
         )
         assert execution is not None
         assert execution.result.kind == "success"
-        assert execution.result.text == "已撤销上一轮对话。\n删除消息：2 条"
+        assert execution.result.text.startswith(
+            "已撤销上一轮对话。"
+            "\n删除消息：2 条"
+            "\n压缩游标：0 → 0"
+            "\n恢复备份："
+        )
+        backup_path = Path(execution.result.text.rsplit("：", 1)[1])
+        assert backup_path.is_file()
         assert memory.calls == [message_ids]
         assert sessions.get_existing("cli:undo").messages == []
         root = current.composition_root
