@@ -1,21 +1,34 @@
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime
-from types import SimpleNamespace
+import shutil
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from agent.plugins.context import PluginContext, PluginKVStore
-from plugin import PluginUndo, UndoCommandModule, _find_last_passive_turn, _undo_last_turn
+from agent.plugin_composition import (
+    COMMANDS,
+    INTERACTION_UNDO,
+    CommandExecution,
+    CommandRegistry,
+    InteractionUndoResult,
+    InteractionUndoService,
+    PluginCommands,
+)
+from agent.plugin_composition.context import CompositionRoot, PluginRuntime
+from agent.plugins.manager import PluginManager
+from bus.event_bus import EventBus
+from plugin import apply
 from session.manager import SessionManager
 
 
-class _MemoryEngine:
-    def __init__(self, *, fail_real_undo: bool = False) -> None:
-        self.calls: list[dict[str, object]] = []
-        self.fail_real_undo = fail_real_undo
+class _DefaultMemory:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def describe(self) -> SimpleNamespace:
+        return SimpleNamespace(name="default")
 
     def undo_by_message_sources(
         self,
@@ -23,90 +36,204 @@ class _MemoryEngine:
         *,
         dry_run: bool = False,
     ) -> dict[str, object]:
-        self.calls.append({"message_ids": list(message_ids), "dry_run": dry_run})
-        if self.fail_real_undo and not dry_run:
-            raise RuntimeError("memory cleanup failed")
-        return {
-            "affected_ids": ["mem1"],
-            "restored_ids": ["old1"],
-            "rollback_source_ids": ["cli:1:0", "cli:1:1", "cli:1:2"],
-        }
+        assert dry_run is False
+        self.calls.append(tuple(message_ids))
+        return {"affected_ids": [], "restored_ids": []}
 
 
-def _run(coro):
-    return asyncio.run(coro)
+async def _registry(
+    result: InteractionUndoResult | None,
+) -> tuple[CompositionRoot, CommandRegistry]:
+    root = CompositionRoot("undo-test")
+    commands = PluginCommands()
+    _ = await root.context.provide(COMMANDS, commands)
+
+    async def undo_latest(_session_key: str) -> InteractionUndoResult | None:
+        return result
+
+    _ = await root.context.provide(
+        INTERACTION_UNDO,
+        InteractionUndoService(undo_latest),
+    )
+    runtime = PluginRuntime(
+        plugin_id="plugin_undo",
+        plugin_dir=Path("/plugin"),
+        data_dir=Path("/data"),
+        workspace=Path("/workspace"),
+        config=None,
+    )
+    _ = await root.mount(
+        lambda ctx: apply(ctx, None),
+        name="plugin_undo",
+        runtime=runtime,
+    )
+    return root, commands.freeze()
 
 
 @pytest.mark.asyncio
-async def test_undo_command_aborts_without_running_llm(tmp_path) -> None:
-    plugin = PluginUndo()
-    session_manager = SessionManager(tmp_path)
-    session = session_manager.get_or_create("cli:1")
-    session.add_message("user", '<system-reminder data-system-context-frame="true">内部</system-reminder>')
-    session.add_message("user", "u0")
-    session.add_message("assistant", "a0")
-    session_manager.save(session)
-    memory_engine = _MemoryEngine()
-    plugin.context = PluginContext(
-        event_bus=None,
-        tool_registry=None,
-        plugin_id="plugin_undo",
-        plugin_dir=tmp_path,
-        data_dir=tmp_path,
-        kv_store=PluginKVStore(tmp_path / ".kv.json"),
-        session_manager=session_manager,
-        memory_engine=memory_engine,
-    )
-    module = UndoCommandModule(plugin)
-    state = SimpleNamespace(
-        session_key="cli:1",
-        session=session,
-        msg=SimpleNamespace(
-            content="/undo",
-            channel="cli",
-            chat_id="1",
-            timestamp=datetime.now(),
+@pytest.mark.parametrize(
+    ("result", "kind", "text"),
+    (
+        (None, "success", "没有可撤销"),
+        (
+            InteractionUndoResult(
+                "turn:1",
+                "cli:1",
+                ("m1", "m2"),
+                "/backup.db",
+                False,
+                3,
+                1,
+            ),
+            "success",
+            "删除消息：2 条",
         ),
+        (
+            InteractionUndoResult(
+                "turn:1",
+                "cli:1",
+                ("m1", "m2"),
+                "/backup.db",
+                True,
+                3,
+                1,
+            ),
+            "error",
+            "等待 Core 重试",
+        ),
+    ),
+)
+async def test_command_projects_core_result_without_private_state(
+    result: InteractionUndoResult | None,
+    kind: str,
+    text: str,
+) -> None:
+    root, registry = await _registry(result)
+
+    execution = await registry.execute(
+        "/undo",
+        session_key="cli:1",
+        channel="cli",
+        chat_id="1",
+        sender="user",
     )
-    frame = SimpleNamespace(input=state, slots={"session:session": state.session})
-    result = await module.run(frame)
-    assert result.slots["session:ctx"].abort is True
-    assert [call["dry_run"] for call in memory_engine.calls] == [True, False]
+
+    assert isinstance(execution, CommandExecution)
+    assert execution.result.kind == kind
+    assert text in execution.result.text
+    await root.dispose()
+    assert root.receipt().effects == ()
 
 
-def test_undo_deletes_context_user_assistant_three_rows(tmp_path: Path) -> None:
-    manager = SessionManager(tmp_path)
-    session = manager.get_or_create("cli:1")
-    session.add_message("user", '<system-reminder data-system-context-frame="true">内部</system-reminder>')
-    session.add_message("user", "u0")
-    session.add_message("assistant", "a0")
-    session.add_message("user", '<system-reminder data-system-context-frame="true">内部</system-reminder>')
-    session.add_message("user", "u1")
-    session.add_message("assistant", "a1")
-    session.last_consolidated = 6
-    manager.save(session)
-    target = _find_last_passive_turn(session.messages)
-    assert target is not None
-    delete_indices, _, _ = target
-    message_ids = [str(session.messages[i]["id"]) for i in delete_indices]
-    result = _run(_undo_last_turn(manager, "cli:1", expected_message_ids=message_ids))
-    assert result is not None
-    assert result.deleted_ids == ["cli:1:3", "cli:1:4", "cli:1:5"]
+def _seed_interaction(manager: SessionManager) -> tuple[str, ...]:
+    now = datetime.now(UTC).isoformat()
+    rows = manager.control_store.persist_session(
+        "cli:undo",
+        created_at=now,
+        updated_at=now,
+        metadata={},
+        messages=[
+            {
+                "role": "user",
+                "content": "question",
+                "timestamp": now,
+                "extra": {
+                    "control_turn_id": "turn:undo",
+                    "turn_input_ordinal": 0,
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "answer",
+                "timestamp": now,
+                "extra": {
+                    "control_turn_id": "turn:undo",
+                    "turn_terminal": True,
+                    "turn_input_count": 1,
+                },
+            },
+        ],
+    )
+    return tuple(str(row["id"]) for row in rows)
 
 
-def test_undo_keeps_cursor_when_target_after_consolidated_prefix(tmp_path: Path) -> None:
-    manager = SessionManager(tmp_path)
-    session = manager.get_or_create("cli:1")
-    for index in range(3):
-        session.add_message("user", '<system-reminder data-system-context-frame="true">内部</system-reminder>')
-        session.add_message("user", f"u{index}")
-        session.add_message("assistant", f"a{index}")
-    session.last_consolidated = 6
-    manager.save(session)
-    target = _find_last_passive_turn(session.messages)
-    assert target is not None
-    delete_indices, _, _ = target
-    message_ids = [str(session.messages[i]["id"]) for i in delete_indices]
-    result = _run(_undo_last_turn(manager, "cli:1", expected_message_ids=message_ids))
-    assert result is not None
-    assert manager.get_or_create("cli:1").last_consolidated == 6
+@pytest.mark.asyncio
+async def test_real_manager_candidate_is_inert_and_formal_command_deletes(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    sessions = SessionManager(workspace)
+    message_ids = _seed_interaction(sessions)
+    memory = _DefaultMemory()
+    source = Path(__file__).resolve().parents[1]
+    plugin_dir = tmp_path / "plugins" / "plugin_undo"
+    plugin_dir.mkdir(parents=True)
+    shutil.copy2(source / "plugin.py", plugin_dir / "plugin.py")
+    shutil.copy2(source / "akashic.plugin.toml", plugin_dir / "akashic.plugin.toml")
+    manager = PluginManager(
+        plugin_dirs=[tmp_path / "plugins"],
+        event_bus=EventBus(),
+        workspace=workspace,
+        session_manager=sessions,
+        memory_engine=memory,
+        installed_cache_root=tmp_path / "cache",
+    )
+    try:
+        await manager.load_all()
+        stable = manager.current_snapshot
+        assert stable is not None and stable.command_registry is not None
+
+        plugin_path = plugin_dir / "plugin.py"
+        plugin_path.write_text(
+            plugin_path.read_text(encoding="utf-8").replace(
+                'version = "2.0.0"',
+                'version = "2.0.1"',
+            ),
+            encoding="utf-8",
+        )
+        manifest_path = plugin_dir / "akashic.plugin.toml"
+        manifest_path.write_text(
+            manifest_path.read_text(encoding="utf-8").replace(
+                'version = "2.0.0"',
+                'version = "2.0.1"',
+            ),
+            encoding="utf-8",
+        )
+        candidate = await manager.prepare_candidate("plugin_undo")
+        assert candidate is not None
+        sessions.invalidate("cli:undo")
+        assert tuple(
+            str(row["id"]) for row in sessions.get_existing("cli:undo").messages
+        ) == message_ids
+        assert memory.calls == []
+
+        published = await manager.publish_prepared("plugin_undo")
+        assert published["publication_state"] == "committed"
+        current = manager.current_snapshot
+        assert current is not None and current.command_registry is not None
+        execution = await current.command_registry.execute(
+            "/undo",
+            session_key="cli:undo",
+            channel="cli",
+            chat_id="undo",
+            sender="user",
+        )
+        assert execution is not None
+        assert execution.result.kind == "success"
+        assert execution.result.text.startswith(
+            "已撤销上一轮对话。"
+            "\n删除消息：2 条"
+            "\n压缩游标：0 → 0"
+            "\n恢复备份："
+        )
+        backup_path = Path(execution.result.text.rsplit("：", 1)[1])
+        assert backup_path.is_file()
+        assert memory.calls == [message_ids]
+        assert sessions.get_existing("cli:undo").messages == []
+        root = current.composition_root
+        assert root is not None
+        await manager.terminate_all()
+        assert root.receipt().effects == ()
+        assert root.receipt().services == ()
+    finally:
+        sessions.close()
